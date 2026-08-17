@@ -7,8 +7,9 @@ CREATE TABLE IF NOT EXISTS items (
   ref           TEXT,            -- Firefly=job_number / SCH=project_id
   customer      TEXT,
   address       TEXT,            -- SCH=项目详情的 street/city/state/postal;Firefly=project_address
-  phone         TEXT,            -- SCH=contact.phone(详情挂了退回 description 解析);Firefly 暂无 → null
-  email         TEXT,            -- SCH=contact.email / Firefly服务单=customer_email;Firefly 安装单无 → null
+  phone         TEXT,            -- 三个源都有:SCH=详情 contact.phone(挂了退回 description 解析)
+                                 -- / FF安装单=详情 customer_phone / FF服务单=列表 customer_phone
+  email         TEXT,            -- 同上,对应各自的 email 字段
   panels        INTEGER,         -- FF安装单=module_quantity / SCH=详情 no_of_panels;服务单 → null
   panel_model   TEXT,            -- 组件瓦数,形如 "500W"(solarcrew 用 parseInt 反解)。
                                  -- FF=solar_panel_id 查选项表 / SCH=module.panel.watts
