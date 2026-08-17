@@ -37,7 +37,9 @@ export default {
     if (url.pathname === "/jobs") {
       await ensureSchema(env);
       const p = url.searchParams;
-      const where = [], binds = [];
+      // 默认只给在途记录。供应商撤掉的行留在库里(审计+复活),但不该再被下游当成活儿。
+      const where = p.get("include_gone") ? [] : ["gone_at IS NULL"];
+      const binds = [];
       if (p.get("source")) { where.push("source = ?"); binds.push(p.get("source")); }
       if (p.get("from"))   { where.push("install_date >= ?"); binds.push(p.get("from")); }
       if (p.get("to"))     { where.push("install_date <= ?"); binds.push(p.get("to")); }
@@ -70,6 +72,7 @@ async function ensureSchema(env) {
       address TEXT, phone TEXT, email TEXT, panels INTEGER, note TEXT,
       install_date TEXT, status TEXT, url TEXT,
       first_seen TEXT NOT NULL, last_seen TEXT NOT NULL, updated_at TEXT NOT NULL,
+      gone_at TEXT,
       PRIMARY KEY (source, external_id))`
   ).run();
   await env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_items_install_date ON items (install_date)`).run();
@@ -78,7 +81,7 @@ async function ensureSchema(env) {
   // 老库补列:CREATE TABLE IF NOT EXISTS 不会给已存在的表加字段
   const { results } = await env.DB.prepare(`PRAGMA table_info(items)`).all();
   const have = new Set((results ?? []).map((col) => col.name));
-  for (const [name, type] of [["email", "TEXT"], ["kind", "TEXT"], ["panels", "INTEGER"], ["note", "TEXT"]]) {
+  for (const [name, type] of [["email", "TEXT"], ["kind", "TEXT"], ["panels", "INTEGER"], ["note", "TEXT"], ["gone_at", "TEXT"]]) {
     if (!have.has(name)) await env.DB.prepare(`ALTER TABLE items ADD COLUMN ${name} ${type}`).run();
   }
 
@@ -115,18 +118,33 @@ async function runAll(env) {
       await alert(env, `${v.id} 拉取失败: ${r.reason?.message || r.reason}`);
       continue; // D1 里上次成功的行原样保留,无需回填
     }
-    const n = await syncVendor(env, v.id, r.value);
+    const n = await syncVendor(env, v.id, r.value, start, end);
     console.log(`[${v.id}] synced ${n} items (${start}~${end})`);
   }
 }
 
 // 读旧状态做 diff,再批量 upsert
-async function syncVendor(env, source, items) {
+async function syncVendor(env, source, items, start, end) {
+  // 只跟窗口内的旧行比。窗口外的行本来就不会被供应商返回,拿它们比会把"日期已过"
+  // 误判成"被取消"。
   const res = await env.DB
-    .prepare("SELECT external_id, status, install_date FROM items WHERE source = ?")
-    .bind(source)
+    .prepare(
+      `SELECT external_id, status, install_date, gone_at FROM items
+       WHERE source = ? AND install_date BETWEEN ? AND ?`
+    )
+    .bind(source, start, end)
     .all();
-  const changes = diff(res.results ?? [], items);
+  const prev = res.results ?? [];
+
+  // 供应商返回空数组、而我们上轮明明有货 —— 更可能是它那边出了问题(token 悄悄失效、
+  // 接口降级返回空页),而不是所有工单同时被取消。这时候标记消失会把整个窗口清空,
+  // 代价太大。告警,本轮什么都不做。
+  if (items.length === 0 && prev.length > 0) {
+    await alert(env, `${source} 返回空列表,但窗口内有 ${prev.length} 条在途记录 —— 本轮跳过,不做消失判定`);
+    return 0;
+  }
+
+  const changes = diff(prev, items);
 
   const now = new Date().toISOString();
   const upsert = env.DB.prepare(
@@ -138,6 +156,7 @@ async function syncVendor(env, source, items) {
        phone=excluded.phone, email=excluded.email, panels=excluded.panels, note=excluded.note,
        install_date=excluded.install_date, status=excluded.status, url=excluded.url,
        last_seen=excluded.last_seen,
+       gone_at=NULL,
        updated_at=CASE WHEN items.status <> excluded.status OR items.install_date <> excluded.install_date
                        THEN excluded.updated_at ELSE items.updated_at END`
   );
@@ -148,6 +167,17 @@ async function syncVendor(env, source, items) {
                 now, now, now)
   );
   if (batch.length) await env.DB.batch(batch); // 原子批量写
+
+  // 本轮没被 upsert 到的窗口内旧行 = 供应商不再上报它了(取消/改到窗口外/被删)。
+  // 打上 gone_at,/jobs 从此不再返回它们。行本身留着:是审计线索,而且工单回来时
+  // (上面的 gone_at=NULL)能原地复活,不会丢 first_seen。
+  await env.DB
+    .prepare(
+      `UPDATE items SET gone_at = ?
+       WHERE source = ? AND install_date BETWEEN ? AND ? AND last_seen < ? AND gone_at IS NULL`
+    )
+    .bind(now, source, start, end, now)
+    .run();
 
   if (changes.length) await notify(env, source, changes);
   return items.length;
@@ -407,12 +437,20 @@ function parseDescription(desc) {
 // 按 external_id 比对上一次:新增 + 状态/日期变化
 function diff(prev, next) {
   const byId = new Map(prev.map((x) => [x.external_id, x]));
+  const seen = new Set();
   const out = [];
   for (const it of next) {
+    seen.add(it.external_id);
     const old = byId.get(it.external_id);
     if (!old) out.push({ type: "new", item: it });
+    else if (old.gone_at) out.push({ type: "returned", item: it }); // 撤销后又排回来
     else if (old.status !== it.status || old.install_date !== it.install_date)
       out.push({ type: "changed", item: it, before: { status: old.status, install_date: old.install_date } });
+  }
+  // 窗口内的旧行这轮没出现 = 供应商撤了它。只报第一次(gone_at 已置的不再重复),
+  // 否则每 3 分钟一轮会把同一条消失记录刷到通知里没完。
+  for (const old of prev) {
+    if (!seen.has(old.external_id) && !old.gone_at) out.push({ type: "gone", before: old });
   }
   return out;
 }
@@ -440,11 +478,19 @@ function authorize(req, env) {
 }
 
 async function notify(env, source, changes) {
-  const lines = changes.map((ch) =>
-    ch.type === "new"
-      ? `🆕 [${source}] ${ch.item.customer} — ${ch.item.install_date} — ${ch.item.address ?? ""}`
-      : `✏️ [${source}] ${ch.item.customer} — ${ch.before.install_date}→${ch.item.install_date} / ${ch.before.status}→${ch.item.status}`
-  );
+  const lines = changes.map((ch) => {
+    switch (ch.type) {
+      case "new":
+        return `🆕 [${source}] ${ch.item.customer} — ${ch.item.install_date} — ${ch.item.address ?? ""}`;
+      case "returned":
+        return `↩️ [${source}] ${ch.item.customer} — ${ch.item.install_date} 重新排回窗口`;
+      // 只有 id 和日期:消失的记录我们手上没有客户信息(prev 只查了几列)。
+      case "gone":
+        return `🚫 [${source}] ${ch.before.external_id} — 原定 ${ch.before.install_date},供应商已不再上报(疑似取消)`;
+      default:
+        return `✏️ [${source}] ${ch.item.customer} — ${ch.before.install_date}→${ch.item.install_date} / ${ch.before.status}→${ch.item.status}`;
+    }
+  });
   console.log(lines.join("\n"));
   if (env.WEBHOOK_URL) await post(env.WEBHOOK_URL, { text: `*${source}* ${changes.length} 条变化\n` + lines.join("\n") });
 }

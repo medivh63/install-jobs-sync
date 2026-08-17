@@ -14,6 +14,8 @@ CREATE TABLE IF NOT EXISTS items (
   install_date  TEXT,            -- YYYY-MM-DD(本地日);服务单存 scheduled_fix_date_start
   status        TEXT,
   url           TEXT,
+  gone_at       TEXT,            -- 供应商不再上报它的时刻(疑似取消)。非空 = /jobs 不再返回;
+                                 -- 工单重新排回来时清空,行本身永不删除(审计线索 + 保住 first_seen)
   first_seen    TEXT NOT NULL,   -- 首次抓到
   last_seen     TEXT NOT NULL,   -- 最近一次抓到(每轮都刷新)
   updated_at    TEXT NOT NULL,   -- 状态/日期真正变化时才刷新
