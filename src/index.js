@@ -5,7 +5,7 @@
 //
 // 统一记录结构:
 //   { source, kind, external_id, ref, customer, address, phone, email,
-//     panels, note, install_date, status, url }
+//     panels, panel_model, note, install_date, status, url }
 //
 // source 是"数据源"而非"公司":firefly / firefly_service / north_energy。
 // Firefly 的安装单和服务单来自两个 query、两套 id 空间(job_id vs service_issue_id),
@@ -19,6 +19,7 @@ const cfg = (env) => ({
   schOrgId: env.SCH_ORG_ID ?? "4973",
   schTz: env.SCH_TZ ?? "America/Edmonton",
   schDetailTtlH: Number(env.SCH_DETAIL_TTL_H ?? 24),
+  ffDetailTtlH: Number(env.FF_DETAIL_TTL_H ?? env.SCH_DETAIL_TTL_H ?? 24),
 });
 
 export default {
@@ -45,7 +46,7 @@ export default {
       if (p.get("to"))     { where.push("install_date <= ?"); binds.push(p.get("to")); }
 
       const sql =
-        "SELECT source, kind, external_id, ref, customer, address, phone, email, panels, note, install_date, status, url FROM items" +
+        "SELECT source, kind, external_id, ref, customer, address, phone, email, panels, panel_model, note, install_date, status, url FROM items" +
         (where.length ? " WHERE " + where.join(" AND ") : "") +
         " ORDER BY install_date";
       const { results } = await env.DB.prepare(sql).bind(...binds).all();
@@ -69,7 +70,7 @@ async function ensureSchema(env) {
   await env.DB.prepare(
     `CREATE TABLE IF NOT EXISTS items (
       source TEXT NOT NULL, external_id TEXT NOT NULL, kind TEXT, ref TEXT, customer TEXT,
-      address TEXT, phone TEXT, email TEXT, panels INTEGER, note TEXT,
+      address TEXT, phone TEXT, email TEXT, panels INTEGER, panel_model TEXT, note TEXT,
       install_date TEXT, status TEXT, url TEXT,
       first_seen TEXT NOT NULL, last_seen TEXT NOT NULL, updated_at TEXT NOT NULL,
       gone_at TEXT,
@@ -81,7 +82,7 @@ async function ensureSchema(env) {
   // 老库补列:CREATE TABLE IF NOT EXISTS 不会给已存在的表加字段
   const { results } = await env.DB.prepare(`PRAGMA table_info(items)`).all();
   const have = new Set((results ?? []).map((col) => col.name));
-  for (const [name, type] of [["email", "TEXT"], ["kind", "TEXT"], ["panels", "INTEGER"], ["note", "TEXT"], ["gone_at", "TEXT"]]) {
+  for (const [name, type] of [["email", "TEXT"], ["kind", "TEXT"], ["panels", "INTEGER"], ["panel_model", "TEXT"], ["note", "TEXT"], ["gone_at", "TEXT"]]) {
     if (!have.has(name)) await env.DB.prepare(`ALTER TABLE items ADD COLUMN ${name} ${type}`).run();
   }
 
@@ -89,11 +90,19 @@ async function ensureSchema(env) {
   await env.DB.prepare(
     `CREATE TABLE IF NOT EXISTS sch_projects (
       project_id TEXT PRIMARY KEY, customer TEXT, address TEXT, phone TEXT, email TEXT,
-      panels INTEGER, fetched_at TEXT NOT NULL)`
+      panels INTEGER, panel_model TEXT, fetched_at TEXT NOT NULL)`
   ).run();
+  await env.DB.prepare(
+    `CREATE TABLE IF NOT EXISTS ff_jobs (
+      job_id TEXT PRIMARY KEY, phone TEXT, email TEXT, panel_model TEXT,
+      fetched_at TEXT NOT NULL)`
+  ).run();
+
   const sp = await env.DB.prepare(`PRAGMA table_info(sch_projects)`).all();
-  if (!(sp.results ?? []).some((col) => col.name === "panels"))
-    await env.DB.prepare(`ALTER TABLE sch_projects ADD COLUMN panels INTEGER`).run();
+  const spHave = new Set((sp.results ?? []).map((col) => col.name));
+  for (const [name, type] of [["panels", "INTEGER"], ["panel_model", "TEXT"]]) {
+    if (!spHave.has(name)) await env.DB.prepare(`ALTER TABLE sch_projects ADD COLUMN ${name} ${type}`).run();
+  }
 }
 
 async function runAll(env) {
@@ -149,11 +158,12 @@ async function syncVendor(env, source, items, start, end) {
   const now = new Date().toISOString();
   const upsert = env.DB.prepare(
     `INSERT INTO items
-       (source, external_id, kind, ref, customer, address, phone, email, panels, note, install_date, status, url, first_seen, last_seen, updated_at)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+       (source, external_id, kind, ref, customer, address, phone, email, panels, panel_model, note, install_date, status, url, first_seen, last_seen, updated_at)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
      ON CONFLICT(source, external_id) DO UPDATE SET
        kind=excluded.kind, ref=excluded.ref, customer=excluded.customer, address=excluded.address,
-       phone=excluded.phone, email=excluded.email, panels=excluded.panels, note=excluded.note,
+       phone=excluded.phone, email=excluded.email, panels=excluded.panels,
+       panel_model=excluded.panel_model, note=excluded.note,
        install_date=excluded.install_date, status=excluded.status, url=excluded.url,
        last_seen=excluded.last_seen,
        gone_at=NULL,
@@ -162,7 +172,7 @@ async function syncVendor(env, source, items, start, end) {
   );
   const batch = items.map((it) =>
     upsert.bind(source, it.external_id, it.kind ?? null, it.ref, it.customer, it.address, it.phone,
-                it.email ?? null, it.panels ?? null, it.note ?? null,
+                it.email ?? null, it.panels ?? null, it.panel_model ?? null, it.note ?? null,
                 it.install_date, it.status, it.url,
                 now, now, now)
   );
@@ -210,24 +220,132 @@ async function fetchFirefly(env, c, start, end) {
     { installer_crew_id: c.ffCrewId }
   );
 
-  return (data.getInstallerJobsByCrewId ?? [])
-    .map((j) => ({
+  // 先筛到窗口再拉详情 —— 详情是按 job 一次一个请求的,不筛就会为窗口外的工单白跑。
+  const jobs = (data.getInstallerJobsByCrewId ?? []).filter((j) => {
+    const d = (j.scheduled_install_date_start || "").slice(0, 10);
+    return d && d >= start && d <= end;
+  });
+
+  const details = await loadFfDetails(env, c, jobs.map((j) => String(j.job_id)));
+
+  return jobs.map((j) => {
+    const d = details.get(String(j.job_id));
+    return {
       source: "firefly",
       kind: "install",
       external_id: String(j.job_id),
       ref: j.job_number,
       customer: j.customer_name,
       address: j.project_address ?? null,
-      phone: null, // 安装单接口不带联系方式,service call 那个才有
-      email: null,
+      // 列表接口不带联系方式,详情接口才有(getJobDetailsTabByJobId)。
+      phone: d?.phone ?? null,
+      email: d?.email ?? null,
       panels: j.module_quantity ?? null,
+      panel_model: d?.panelModel ?? null,
       note: null,
       install_date: (j.scheduled_install_date_start || "").slice(0, 10) || null,
       status: j.job_status,
       url: null,
-    }))
-    // 客户端筛到统一窗口(未排期的 install_date=null 直接丢)
-    .filter((it) => it.install_date && it.install_date >= start && it.install_date <= end);
+    };
+  });
+}
+
+// Firefly 详情缓存。和 SCH 那套同样的理由:详情是一 job 一请求,不缓存的话每轮
+// cron 会把窗口内所有工单重拉一遍。命中且未过期就直接用旧值。
+async function loadFfDetails(env, c, ids) {
+  const out = new Map();
+  if (!ids.length) return out;
+
+  const { results } = await env.DB
+    .prepare(`SELECT job_id, phone, email, panel_model AS panelModel, fetched_at FROM ff_jobs
+              WHERE job_id IN (${ids.map(() => "?").join(",")})`)
+    .bind(...ids)
+    .all();
+  const cached = new Map((results ?? []).map((r) => [r.job_id, r]));
+
+  const freshAfter = Date.now() - c.ffDetailTtlH * 3600000;
+  const stale = [];
+  for (const id of ids) {
+    const row = cached.get(id);
+    if (row) out.set(id, row);
+    if (!row || !(Date.parse(row.fetched_at) >= freshAfter)) stale.push(id);
+  }
+  if (!stale.length) return out;
+
+  // 组件型号只给了 solar_panel_id,要靠下拉选项表翻译成瓦数。表很小(十几条)且
+  // 全组织共用,所以整轮只查一次,而不是每个 job 查一次。
+  const panels = await ffPanelWatts(env);
+
+  const fetched = await pooled(stale, 4, async (id) => {
+    try {
+      return [id, await fetchFfJob(env, id, panels)];
+    } catch (e) {
+      console.error(`[firefly] detail ${id} failed:`, e.message);
+      return null;
+    }
+  });
+
+  const now = new Date().toISOString();
+  const up = env.DB.prepare(
+    `INSERT INTO ff_jobs (job_id, phone, email, panel_model, fetched_at)
+     VALUES (?,?,?,?,?)
+     ON CONFLICT(job_id) DO UPDATE SET
+       phone=excluded.phone, email=excluded.email,
+       panel_model=excluded.panel_model, fetched_at=excluded.fetched_at`
+  );
+  const batch = [];
+  for (const hit of fetched) {
+    if (!hit) continue;
+    const [id, d] = hit;
+    out.set(id, d);
+    batch.push(up.bind(id, d.phone, d.email, d.panelModel, now));
+  }
+  if (batch.length) await env.DB.batch(batch);
+  return out;
+}
+
+async function fetchFfJob(env, jobId, panels) {
+  const data = await ffQuery(
+    env,
+    "GetJobDetailsTabByJobId",
+    "query GetJobDetailsTabByJobId($ff_job_id: Int!) {" +
+      " getJobDetailsTabByJobId(ff_job_id: $ff_job_id) {" +
+      " customer_phone customer_email solar_panel_id system_size_kw module_quantity } }",
+    { ff_job_id: Number(jobId) }
+  );
+  const d = data.getJobDetailsTabByJobId ?? {};
+  return {
+    phone: d.customer_phone || null,
+    email: d.customer_email || null,
+    panelModel: ffPanelModel(d, panels),
+  };
+}
+
+// 优先查选项表(权威),查不到再用 系统容量÷块数 反推。反推只在两者能整除出一个
+// 合理瓦数时才采信 —— system_size_kw 是取整过的,除不尽就说明推不出准确值。
+function ffPanelModel(d, panels) {
+  const named = panels.get(String(d.solar_panel_id));
+  if (named) return `${named}W`;
+  const kw = Number(d.system_size_kw), n = Number(d.module_quantity);
+  if (!kw || !n) return null;
+  const watts = (kw * 1000) / n;
+  return Number.isInteger(watts) && watts >= 200 && watts <= 800 ? `${watts}W` : null;
+}
+
+// solar_panel_id → 瓦数。选项文案形如 "Solar Panel LONGi 500",取末尾数字。
+async function ffPanelWatts(env) {
+  const map = new Map();
+  try {
+    const data = await ffQuery(env, "GetSolarPanelSelectOptions",
+      "query GetSolarPanelSelectOptions { getSolarPanelSelectOptions { id value } }", {});
+    for (const o of data.getSolarPanelSelectOptions ?? []) {
+      const m = String(o.value || "").match(/(\d{3,4})\s*$/);
+      if (m) map.set(String(o.id), Number(m[1]));
+    }
+  } catch (e) {
+    console.error("[firefly] panel options failed:", e.message); // 退回反推
+  }
+  return map;
 }
 
 // ---------- 适配器 A2:Firefly 售后服务单(service call)----------
@@ -256,6 +374,7 @@ async function fetchFireflyService(env, c, start, end) {
       phone: s.customer_phone ?? null,
       email: s.customer_email ?? null,
       panels: null, // 售后不按板数计件
+      panel_model: null,
       note: [s.support_category, s.issue_summary].filter(Boolean).join(": ") || null,
       install_date: (s.scheduled_fix_date_start || "").slice(0, 10) || null,
       status: s.service_issue_status || s.service_status || null,
@@ -299,6 +418,7 @@ async function fetchSch(env, c, start, end) {
       phone: d?.phone || fromDesc.phone,
       email: d?.email ?? null,
       panels: d?.panels ?? null, // 详情的 no_of_panels;详情挂了就为空
+      panel_model: d?.panelModel ?? null, // 详情的 module.panel.watts,拼成 "445W"
       note: null,
       install_date: localDate(a.slot_start_datetime, c.schTz),
       status: a.appointment_type?.name || (a.status ? "done" : "scheduled"),
@@ -320,7 +440,7 @@ async function loadSchDetails(env, c, ids) {
   if (!ids.length) return out;
 
   const { results } = await env.DB
-    .prepare(`SELECT project_id, customer, address, phone, email, panels, fetched_at FROM sch_projects
+    .prepare(`SELECT project_id, customer, address, phone, email, panels, panel_model AS panelModel, fetched_at FROM sch_projects
               WHERE project_id IN (${ids.map(() => "?").join(",")})`)
     .bind(...ids)
     .all();
@@ -347,18 +467,19 @@ async function loadSchDetails(env, c, ids) {
 
   const now = new Date().toISOString();
   const up = env.DB.prepare(
-    `INSERT INTO sch_projects (project_id, customer, address, phone, email, panels, fetched_at)
-     VALUES (?,?,?,?,?,?,?)
+    `INSERT INTO sch_projects (project_id, customer, address, phone, email, panels, panel_model, fetched_at)
+     VALUES (?,?,?,?,?,?,?,?)
      ON CONFLICT(project_id) DO UPDATE SET
        customer=excluded.customer, address=excluded.address, phone=excluded.phone,
-       email=excluded.email, panels=excluded.panels, fetched_at=excluded.fetched_at`
+       email=excluded.email, panels=excluded.panels, panel_model=excluded.panel_model,
+       fetched_at=excluded.fetched_at`
   );
   const batch = [];
   for (const hit of fetched) {
     if (!hit) continue;
     const [id, d] = hit;
     out.set(id, d);
-    batch.push(up.bind(id, d.customer, d.address, d.phone, d.email, d.panels ?? null, now));
+    batch.push(up.bind(id, d.customer, d.address, d.phone, d.email, d.panels ?? null, d.panelModel ?? null, now));
   }
   if (batch.length) await env.DB.batch(batch);
   return out;
@@ -384,6 +505,9 @@ async function fetchSchProject(env, c, projectId) {
     // 板数两处都有且实测一致(no_of_panels=14 / designs.total_panels=14)。
     // designs 是对象不是数组。0 是合法值(储能-only 项目),所以用 ?? 不用 ||。
     panels: p.no_of_panels ?? p.designs?.total_panels ?? null,
+    // 组件型号在 module.panel.watts(数字)。solarcrew 的 panel_model 是 "445W"
+    // 这种瓦数串(它用 parseInt 反解),所以这里就地拼好,下游不用认识两家的格式。
+    panelModel: p.module?.panel?.watts ? `${p.module.panel.watts}W` : null,
   };
 }
 

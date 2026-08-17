@@ -17,7 +17,8 @@ FF_CREW_ID  = "15"              # Firefly 的 installer_crew_id
 SCH_ORG_ID  = "4973"           # SubcontractorHub 路径里的组织 id
 WINDOW_DAYS = "30"             # 统一"未来窗口"天数;B 家 API 必须给日期区间,A 家用它客户端筛
 SCH_TZ      = "America/Edmonton"  # B 家 slot 是 UTC,按这个时区折算安装日(阿省=Mountain Time)
-SCH_DETAIL_TTL_H = "24"         # B 家 project 详情缓存时长(小时);详情给结构化姓名/电话/邮箱/地址
+SCH_DETAIL_TTL_H = "24"         # B 家 project 详情缓存时长(小时);详情给结构化姓名/电话/邮箱/地址/板数/瓦数
+FF_DETAIL_TTL_H  = "24"         # A 家 job 详情缓存时长(小时);详情给电话/邮箱/组件瓦数。缺省沿用上面那个
 
 # 敏感值走 secret,别写在这里:
 #   wrangler secret put FF_SESSION   # Firefly ff_session cookie(⚠️会过期,需定期更新)

@@ -10,6 +10,8 @@ CREATE TABLE IF NOT EXISTS items (
   phone         TEXT,            -- SCH=contact.phone(详情挂了退回 description 解析);Firefly 暂无 → null
   email         TEXT,            -- SCH=contact.email / Firefly服务单=customer_email;Firefly 安装单无 → null
   panels        INTEGER,         -- FF安装单=module_quantity / SCH=详情 no_of_panels;服务单 → null
+  panel_model   TEXT,            -- 组件瓦数,形如 "500W"(solarcrew 用 parseInt 反解)。
+                                 -- FF=solar_panel_id 查选项表 / SCH=module.panel.watts
   note          TEXT,            -- 服务单的 "支持分类: 问题摘要";安装单 → null
   install_date  TEXT,            -- YYYY-MM-DD(本地日);服务单存 scheduled_fix_date_start
   status        TEXT,
@@ -34,5 +36,15 @@ CREATE TABLE IF NOT EXISTS sch_projects (
   phone       TEXT,              -- contact.phone(+1##########)
   email       TEXT,              -- contact.email
   panels      INTEGER,           -- no_of_panels(与 designs.total_panels 一致)
+  fetched_at  TEXT NOT NULL      -- 上次拉详情的时间,过期才重拉
+);
+
+-- Firefly 工单详情缓存。列表接口不带联系方式和组件型号,详情要按 job 一个个查
+-- (getJobDetailsTabByJobId),不缓存的话每轮 cron 会把窗口内所有工单重拉一遍。
+CREATE TABLE IF NOT EXISTS ff_jobs (
+  job_id      TEXT PRIMARY KEY,  -- Firefly job_id
+  phone       TEXT,              -- customer_phone
+  email       TEXT,              -- customer_email
+  panel_model TEXT,              -- solar_panel_id 经选项表翻译成的 "500W"
   fetched_at  TEXT NOT NULL      -- 上次拉详情的时间,过期才重拉
 );
