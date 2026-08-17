@@ -1,0 +1,9 @@
+# wrangler 的本地状态与缓存(含 wrangler-account.json:账户 id)
+.wrangler/
+
+# 本地开发用的密钥。线上走 `wrangler secret put`,这个文件永远不入库。
+.dev.vars
+.dev.vars.*
+
+node_modules/
+.DS_Store
