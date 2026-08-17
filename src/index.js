@@ -86,8 +86,11 @@ async function ensureSchema(env) {
   await env.DB.prepare(
     `CREATE TABLE IF NOT EXISTS sch_projects (
       project_id TEXT PRIMARY KEY, customer TEXT, address TEXT, phone TEXT, email TEXT,
-      fetched_at TEXT NOT NULL)`
+      panels INTEGER, fetched_at TEXT NOT NULL)`
   ).run();
+  const sp = await env.DB.prepare(`PRAGMA table_info(sch_projects)`).all();
+  if (!(sp.results ?? []).some((col) => col.name === "panels"))
+    await env.DB.prepare(`ALTER TABLE sch_projects ADD COLUMN panels INTEGER`).run();
 }
 
 async function runAll(env) {
@@ -187,7 +190,7 @@ async function fetchFirefly(env, c, start, end) {
       address: j.project_address ?? null,
       phone: null, // 安装单接口不带联系方式,service call 那个才有
       email: null,
-      panels: j.module_quantity ?? null, // 唯一一家给板数的
+      panels: j.module_quantity ?? null,
       note: null,
       install_date: (j.scheduled_install_date_start || "").slice(0, 10) || null,
       status: j.job_status,
@@ -265,7 +268,7 @@ async function fetchSch(env, c, start, end) {
       address: d?.address || fromDesc.address,
       phone: d?.phone || fromDesc.phone,
       email: d?.email ?? null,
-      panels: null, // SCH 的 project 详情里没有板数
+      panels: d?.panels ?? null, // 详情的 no_of_panels;详情挂了就为空
       note: null,
       install_date: localDate(a.slot_start_datetime, c.schTz),
       status: a.appointment_type?.name || (a.status ? "done" : "scheduled"),
@@ -287,7 +290,7 @@ async function loadSchDetails(env, c, ids) {
   if (!ids.length) return out;
 
   const { results } = await env.DB
-    .prepare(`SELECT project_id, customer, address, phone, email, fetched_at FROM sch_projects
+    .prepare(`SELECT project_id, customer, address, phone, email, panels, fetched_at FROM sch_projects
               WHERE project_id IN (${ids.map(() => "?").join(",")})`)
     .bind(...ids)
     .all();
@@ -314,18 +317,18 @@ async function loadSchDetails(env, c, ids) {
 
   const now = new Date().toISOString();
   const up = env.DB.prepare(
-    `INSERT INTO sch_projects (project_id, customer, address, phone, email, fetched_at)
-     VALUES (?,?,?,?,?,?)
+    `INSERT INTO sch_projects (project_id, customer, address, phone, email, panels, fetched_at)
+     VALUES (?,?,?,?,?,?,?)
      ON CONFLICT(project_id) DO UPDATE SET
        customer=excluded.customer, address=excluded.address, phone=excluded.phone,
-       email=excluded.email, fetched_at=excluded.fetched_at`
+       email=excluded.email, panels=excluded.panels, fetched_at=excluded.fetched_at`
   );
   const batch = [];
   for (const hit of fetched) {
     if (!hit) continue;
     const [id, d] = hit;
     out.set(id, d);
-    batch.push(up.bind(id, d.customer, d.address, d.phone, d.email, now));
+    batch.push(up.bind(id, d.customer, d.address, d.phone, d.email, d.panels ?? null, now));
   }
   if (batch.length) await env.DB.batch(batch);
   return out;
@@ -348,6 +351,9 @@ async function fetchSchProject(env, c, projectId) {
     address: joinAddr(p.street || ct.street, p.city || ct.city, p.state || ct.state, p.postal_code || ct.postal_code),
     phone: ct.phone || null,
     email: ct.email || null,
+    // 板数两处都有且实测一致(no_of_panels=14 / designs.total_panels=14)。
+    // designs 是对象不是数组。0 是合法值(储能-only 项目),所以用 ?? 不用 ||。
+    panels: p.no_of_panels ?? p.designs?.total_panels ?? null,
   };
 }
 

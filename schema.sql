@@ -9,7 +9,7 @@ CREATE TABLE IF NOT EXISTS items (
   address       TEXT,            -- SCH=项目详情的 street/city/state/postal;Firefly=project_address
   phone         TEXT,            -- SCH=contact.phone(详情挂了退回 description 解析);Firefly 暂无 → null
   email         TEXT,            -- SCH=contact.email / Firefly服务单=customer_email;Firefly 安装单无 → null
-  panels        INTEGER,         -- Firefly 安装单=module_quantity;其余来源不给 → null
+  panels        INTEGER,         -- FF安装单=module_quantity / SCH=详情 no_of_panels;服务单 → null
   note          TEXT,            -- 服务单的 "支持分类: 问题摘要";安装单 → null
   install_date  TEXT,            -- YYYY-MM-DD(本地日);服务单存 scheduled_fix_date_start
   status        TEXT,
@@ -31,5 +31,6 @@ CREATE TABLE IF NOT EXISTS sch_projects (
   address      TEXT,             -- street, city, state, postal_code
   phone       TEXT,              -- contact.phone(+1##########)
   email       TEXT,              -- contact.email
+  panels      INTEGER,           -- no_of_panels(与 designs.total_panels 一致)
   fetched_at  TEXT NOT NULL      -- 上次拉详情的时间,过期才重拉
 );
