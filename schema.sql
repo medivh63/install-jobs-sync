@@ -14,6 +14,7 @@ CREATE TABLE IF NOT EXISTS items (
   panel_model   TEXT,            -- 组件瓦数,形如 "500W"(solarcrew 用 parseInt 反解)。
                                  -- FF=solar_panel_id 查选项表 / SCH=module.panel.watts
   note          TEXT,            -- 服务单的 "支持分类: 问题摘要";安装单 → null
+  description   TEXT,            -- SCH 预约的原始自由文本(调度备注);其余来源 → null
   install_date  TEXT,            -- YYYY-MM-DD(本地日);服务单存 scheduled_fix_date_start
   status        TEXT,
   url           TEXT,

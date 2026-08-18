@@ -5,7 +5,7 @@
 //
 // 统一记录结构:
 //   { source, kind, external_id, ref, customer, address, phone, email,
-//     panels, panel_model, note, install_date, status, url }
+//     panels, panel_model, note, description, install_date, status, url }
 //
 // source 是"数据源"而非"公司":firefly / firefly_service / north_energy。
 // Firefly 的安装单和服务单来自两个 query、两套 id 空间(job_id vs service_issue_id),
@@ -46,7 +46,7 @@ export default {
       if (p.get("to"))     { where.push("install_date <= ?"); binds.push(p.get("to")); }
 
       const sql =
-        "SELECT source, kind, external_id, ref, customer, address, phone, email, panels, panel_model, note, install_date, status, url FROM items" +
+        "SELECT source, kind, external_id, ref, customer, address, phone, email, panels, panel_model, note, description, install_date, status, url FROM items" +
         (where.length ? " WHERE " + where.join(" AND ") : "") +
         " ORDER BY install_date";
       const { results } = await env.DB.prepare(sql).bind(...binds).all();
@@ -71,6 +71,7 @@ async function ensureSchema(env) {
     `CREATE TABLE IF NOT EXISTS items (
       source TEXT NOT NULL, external_id TEXT NOT NULL, kind TEXT, ref TEXT, customer TEXT,
       address TEXT, phone TEXT, email TEXT, panels INTEGER, panel_model TEXT, note TEXT,
+      description TEXT,
       install_date TEXT, status TEXT, url TEXT,
       first_seen TEXT NOT NULL, last_seen TEXT NOT NULL, updated_at TEXT NOT NULL,
       gone_at TEXT,
@@ -82,7 +83,7 @@ async function ensureSchema(env) {
   // 老库补列:CREATE TABLE IF NOT EXISTS 不会给已存在的表加字段
   const { results } = await env.DB.prepare(`PRAGMA table_info(items)`).all();
   const have = new Set((results ?? []).map((col) => col.name));
-  for (const [name, type] of [["email", "TEXT"], ["kind", "TEXT"], ["panels", "INTEGER"], ["panel_model", "TEXT"], ["note", "TEXT"], ["gone_at", "TEXT"]]) {
+  for (const [name, type] of [["email", "TEXT"], ["kind", "TEXT"], ["panels", "INTEGER"], ["panel_model", "TEXT"], ["note", "TEXT"], ["description", "TEXT"], ["gone_at", "TEXT"]]) {
     if (!have.has(name)) await env.DB.prepare(`ALTER TABLE items ADD COLUMN ${name} ${type}`).run();
   }
 
@@ -158,12 +159,12 @@ async function syncVendor(env, source, items, start, end) {
   const now = new Date().toISOString();
   const upsert = env.DB.prepare(
     `INSERT INTO items
-       (source, external_id, kind, ref, customer, address, phone, email, panels, panel_model, note, install_date, status, url, first_seen, last_seen, updated_at)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+       (source, external_id, kind, ref, customer, address, phone, email, panels, panel_model, note, description, install_date, status, url, first_seen, last_seen, updated_at)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
      ON CONFLICT(source, external_id) DO UPDATE SET
        kind=excluded.kind, ref=excluded.ref, customer=excluded.customer, address=excluded.address,
        phone=excluded.phone, email=excluded.email, panels=excluded.panels,
-       panel_model=excluded.panel_model, note=excluded.note,
+       panel_model=excluded.panel_model, note=excluded.note, description=excluded.description,
        install_date=excluded.install_date, status=excluded.status, url=excluded.url,
        last_seen=excluded.last_seen,
        gone_at=NULL,
@@ -173,6 +174,7 @@ async function syncVendor(env, source, items, start, end) {
   const batch = items.map((it) =>
     upsert.bind(source, it.external_id, it.kind ?? null, it.ref, it.customer, it.address, it.phone,
                 it.email ?? null, it.panels ?? null, it.panel_model ?? null, it.note ?? null,
+                it.description ?? null,
                 it.install_date, it.status, it.url,
                 now, now, now)
   );
@@ -375,6 +377,7 @@ async function fetchFireflyService(env, c, start, end) {
       email: s.customer_email ?? null,
       panels: null, // 售后不按板数计件
       panel_model: null,
+      description: null,
       note: [s.support_category, s.issue_summary].filter(Boolean).join(": ") || null,
       install_date: (s.scheduled_fix_date_start || "").slice(0, 10) || null,
       status: s.service_issue_status || s.service_status || null,
@@ -417,6 +420,9 @@ async function fetchSch(env, c, start, end) {
       address: d?.address || fromDesc.address,
       phone: d?.phone || fromDesc.phone,
       email: d?.email ?? null,
+      // 原始自由文本原样留着:parseDescription 只从中抽电话/地址/链接,剩下的
+      // 调度备注(门禁码、狗、停车说明之类)靠它带给下游。
+      description: a.description || null,
       panels: d?.panels ?? null, // 详情的 no_of_panels;详情挂了就为空
       panel_model: d?.panelModel ?? null, // 详情的 module.panel.watts,拼成 "445W"
       note: null,
