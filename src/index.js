@@ -418,9 +418,9 @@ async function fetchSch(env, c, start, end) {
       address: d?.address || fromDesc.address,
       phone: d?.phone || fromDesc.phone,
       email: d?.email ?? null,
-      // 原始自由文本原样留着:parseDescription 只从中抽电话/地址/链接,剩下的
-      // 调度备注(门禁码、狗、停车说明之类)靠它带给下游。
-      description: a.description || null,
+      // 调度备注(门禁码、狗、停车说明之类)。链接剔掉——它是给他们内部系统用的,
+      // 对班组没意义,而且会占满聊天里的一整行。
+      description: stripUrls(a.description),
       panels: d?.panels ?? null, // 详情的 no_of_panels;详情挂了就为空
       panel_model: d?.panelModel ?? null, // 详情的 module.panel.watts,拼成 "445W"
       note: null,
@@ -546,6 +546,19 @@ function localDate(iso, tz) {
   return new Intl.DateTimeFormat("en-CA", {
     timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit",
   }).format(new Date(iso)); // en-CA → "2026-08-04"
+}
+
+// 去掉自由文本里的链接。实测三种分隔风格都存在(" - "、em dash "—"、"---"),
+// 而链接前面总挂着一个,所以删完还要收尾——否则备注会以一截孤零零的破折号结束。
+function stripUrls(s) {
+  if (!s) return null;
+  return (
+    s
+      .replace(/https?:\/\/\S+/g, " ")
+      .replace(/\s{2,}/g, " ")
+      .replace(/[\s\u2013\u2014-]+$/, "")
+      .trim() || null
+  );
 }
 
 // "电话 <分隔> 地址 <分隔> 链接" 自由文本。分隔符不统一(" - " 或 "---"/"------"),
