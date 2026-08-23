@@ -5,7 +5,7 @@
 //
 // 统一记录结构:
 //   { source, kind, external_id, ref, customer, address, phone, email,
-//     panels, panel_model, note, description, install_date, status, url }
+//     panels, panel_model, note, description, install_date, status }
 //
 // source 是"数据源"而非"公司":firefly / firefly_service / north_energy。
 // Firefly 的安装单和服务单来自两个 query、两套 id 空间(job_id vs service_issue_id),
@@ -46,7 +46,7 @@ export default {
       if (p.get("to"))     { where.push("install_date <= ?"); binds.push(p.get("to")); }
 
       const sql =
-        "SELECT source, kind, external_id, ref, customer, address, phone, email, panels, panel_model, note, description, install_date, status, url FROM items" +
+        "SELECT source, kind, external_id, ref, customer, address, phone, email, panels, panel_model, note, description, install_date, status FROM items" +
         (where.length ? " WHERE " + where.join(" AND ") : "") +
         " ORDER BY install_date";
       const { results } = await env.DB.prepare(sql).bind(...binds).all();
@@ -72,7 +72,7 @@ async function ensureSchema(env) {
       source TEXT NOT NULL, external_id TEXT NOT NULL, kind TEXT, ref TEXT, customer TEXT,
       address TEXT, phone TEXT, email TEXT, panels INTEGER, panel_model TEXT, note TEXT,
       description TEXT,
-      install_date TEXT, status TEXT, url TEXT,
+      install_date TEXT, status TEXT,
       first_seen TEXT NOT NULL, last_seen TEXT NOT NULL, updated_at TEXT NOT NULL,
       gone_at TEXT,
       PRIMARY KEY (source, external_id))`
@@ -159,13 +159,13 @@ async function syncVendor(env, source, items, start, end) {
   const now = new Date().toISOString();
   const upsert = env.DB.prepare(
     `INSERT INTO items
-       (source, external_id, kind, ref, customer, address, phone, email, panels, panel_model, note, description, install_date, status, url, first_seen, last_seen, updated_at)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+       (source, external_id, kind, ref, customer, address, phone, email, panels, panel_model, note, description, install_date, status, first_seen, last_seen, updated_at)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
      ON CONFLICT(source, external_id) DO UPDATE SET
        kind=excluded.kind, ref=excluded.ref, customer=excluded.customer, address=excluded.address,
        phone=excluded.phone, email=excluded.email, panels=excluded.panels,
        panel_model=excluded.panel_model, note=excluded.note, description=excluded.description,
-       install_date=excluded.install_date, status=excluded.status, url=excluded.url,
+       install_date=excluded.install_date, status=excluded.status,
        last_seen=excluded.last_seen,
        gone_at=NULL,
        updated_at=CASE WHEN items.status <> excluded.status OR items.install_date <> excluded.install_date
@@ -175,7 +175,7 @@ async function syncVendor(env, source, items, start, end) {
     upsert.bind(source, it.external_id, it.kind ?? null, it.ref, it.customer, it.address, it.phone,
                 it.email ?? null, it.panels ?? null, it.panel_model ?? null, it.note ?? null,
                 it.description ?? null,
-                it.install_date, it.status, it.url,
+                it.install_date, it.status,
                 now, now, now)
   );
   if (batch.length) await env.DB.batch(batch); // 原子批量写
@@ -247,7 +247,6 @@ async function fetchFirefly(env, c, start, end) {
       note: null,
       install_date: (j.scheduled_install_date_start || "").slice(0, 10) || null,
       status: j.job_status,
-      url: null,
     };
   });
 }
@@ -381,7 +380,6 @@ async function fetchFireflyService(env, c, start, end) {
       note: [s.support_category, s.issue_summary].filter(Boolean).join(": ") || null,
       install_date: (s.scheduled_fix_date_start || "").slice(0, 10) || null,
       status: s.service_issue_status || s.service_status || null,
-      url: null,
     }))
     .filter((it) => it.install_date && it.install_date >= start && it.install_date <= end);
 }
@@ -428,7 +426,6 @@ async function fetchSch(env, c, start, end) {
       note: null,
       install_date: localDate(a.slot_start_datetime, c.schTz),
       status: a.appointment_type?.name || (a.status ? "done" : "scheduled"),
-      url: fromDesc.url,
     };
   });
 }
@@ -554,14 +551,15 @@ function localDate(iso, tz) {
 // "电话 <分隔> 地址 <分隔> 链接" 自由文本。分隔符不统一(" - " 或 "---"/"------"),
 // 按"2+ 连续短横线,或前后带空格的单短横线"切,避免误伤地址内的连字符。启发式,格式大改仍需调整。
 function parseDescription(desc) {
+  // 链接本身不再入库,但这个匹配仍然必要:它是地址解析的右边界,
+  // 去掉的话 URL 会被当成地址的一部分拼进去。
   const m = desc.match(/https?:\/\/\S+/);
-  const url = m ? m[0] : null;
   const rest = m ? desc.slice(0, m.index) : desc; // 只取链接之前的部分
   const parts = rest.split(/-{2,}|\s-\s/).map((s) => s.trim()).filter(Boolean);
   let phone = null;
   if (parts.length && /^\+?\d[\d\s()-]{5,}$/.test(parts[0])) phone = parts.shift(); // 抽出开头电话段
   const address = parts.join(" ").replace(/[\s-]+$/, "").trim() || null;
-  return { address, phone, url };
+  return { address, phone };
 }
 
 // 按 external_id 比对上一次:新增 + 状态/日期变化

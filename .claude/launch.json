@@ -1,0 +1,17 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "solarcrew-backend",
+      "runtimeExecutable": "sh",
+      "runtimeArgs": ["-c", "cd /Users/medivh/solarcrew/backend && ADDR=:8080 exec go run ./cmd/server"],
+      "port": 8080
+    },
+    {
+      "name": "solarcrew-frontend",
+      "runtimeExecutable": "sh",
+      "runtimeArgs": ["-c", "cd /Users/medivh/solarcrew/frontend && NEXT_PUBLIC_API_BASE=http://localhost:8080 exec ./node_modules/.bin/next dev -p 3000"],
+      "port": 3000
+    }
+  ]
+}
