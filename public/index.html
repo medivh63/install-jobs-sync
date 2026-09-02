@@ -1,0 +1,406 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>安装预约</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🔆</text></svg>">
+<style>
+  :root {
+    --bg: #f5f6f8; --card: #ffffff; --ink: #1a2233; --muted: #6b7280;
+    --line: #e5e7eb; --brand: #f59e0b; --brand-ink: #92600a;
+    --free: #16a34a; --free-bg: #ecfdf3; --full: #b91c1c; --full-bg: #fef2f2;
+    --blocked-bg: #f3f4f6; --pending: #b45309; --confirmed: #15803d; --cancelled: #6b7280;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+         font: 15px/1.5 -apple-system, "PingFang SC", "Microsoft YaHei", system-ui, sans-serif; }
+  .wrap { max-width: 560px; margin: 0 auto; padding: 16px 12px 48px; }
+  h1 { font-size: 20px; margin: 8px 4px 16px; }
+  h1 small { font-weight: 400; color: var(--muted); font-size: 13px; margin-left: 8px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 14px; margin-bottom: 14px; }
+
+  /* 日历 */
+  .cal-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
+  .cal-head b { font-size: 16px; }
+  .nav-btn { border: 1px solid var(--line); background: var(--card); border-radius: 10px;
+             width: 36px; height: 36px; font-size: 18px; color: var(--ink); }
+  .grid { display: grid; grid-template-columns: repeat(7, 1fr); gap: 4px; }
+  .dow { text-align: center; color: var(--muted); font-size: 12px; padding: 4px 0; }
+  .day { position: relative; border: 1px solid var(--line); border-radius: 10px; min-height: 52px;
+         padding: 4px 0 2px; text-align: center; background: var(--card); font-size: 14px; }
+  .day.off { visibility: hidden; }
+  .day .st { display: block; font-size: 10px; margin-top: 2px; }
+  .day.free    { background: var(--free-bg); border-color: #bbe7cc; color: var(--free); font-weight: 600; }
+  .day.full    { background: var(--full-bg); border-color: #f3c6c6; color: var(--full); }
+  .day.blocked { background: var(--blocked-bg); color: var(--muted); }
+  .day.past    { background: transparent; color: #c4c8d0; border-color: #eef0f3; }
+  .day.today::after { content: ""; position: absolute; left: 50%; bottom: 3px; transform: translateX(-50%);
+                      width: 4px; height: 4px; border-radius: 2px; background: var(--brand); }
+  .legend { display: flex; gap: 14px; margin-top: 10px; font-size: 12px; color: var(--muted); flex-wrap: wrap; }
+  .legend i { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 4px; }
+
+  /* 弹层 */
+  .sheet-bg { position: fixed; inset: 0; background: rgba(15,20,30,.45); display: none; z-index: 10; }
+  .sheet-bg.open { display: block; }
+  .sheet { position: fixed; left: 0; right: 0; bottom: 0; z-index: 11; background: var(--card);
+           border-radius: 18px 18px 0 0; padding: 16px 16px calc(20px + env(safe-area-inset-bottom));
+           max-height: 86vh; overflow-y: auto; display: none; max-width: 560px; margin: 0 auto; }
+  .sheet.open { display: block; }
+  .sheet h2 { font-size: 17px; margin: 0 0 12px; }
+  .row { margin-bottom: 10px; }
+  .row label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 4px; }
+  .row input, .row textarea { width: 100%; border: 1px solid var(--line); border-radius: 10px;
+        padding: 10px; font: inherit; background: var(--bg); }
+  .row input[type=file] { padding: 8px; background: transparent; }
+  .btn { display: block; width: 100%; border: 0; border-radius: 12px; padding: 13px; font: inherit;
+         font-weight: 600; background: var(--brand); color: #fff; margin-top: 6px; }
+  .btn[disabled] { opacity: .5; }
+  .btn.ghost { background: transparent; color: var(--muted); font-weight: 400; padding: 10px; }
+  .btn.small { display: inline-block; width: auto; padding: 7px 14px; font-size: 13px; margin: 0 6px 0 0; }
+  .btn.danger { background: #fee2e2; color: var(--full); }
+  .btn.ok { background: #dcfce7; color: var(--confirmed); }
+
+  .bk { border: 1px solid var(--line); border-radius: 12px; padding: 10px 12px; margin-bottom: 8px; }
+  .bk b { font-size: 14px; }
+  .bk .meta { color: var(--muted); font-size: 13px; margin-top: 2px; }
+  .chip { float: right; font-size: 12px; padding: 2px 8px; border-radius: 8px; }
+  .chip.pending   { background: #fef3c7; color: var(--pending); }
+  .chip.confirmed { background: #dcfce7; color: var(--confirmed); }
+  .chip.cancelled { background: #f3f4f6; color: var(--cancelled); text-decoration: line-through; }
+  .files a { font-size: 13px; color: var(--brand-ink); margin-right: 10px; }
+
+  .hint { color: var(--muted); font-size: 13px; }
+  .err { color: var(--full); font-size: 13px; margin-top: 8px; min-height: 18px; }
+  footer { text-align: center; margin-top: 20px; }
+  footer button { border: 0; background: none; color: #c4c8d0; font-size: 12px; }
+
+  /* 口令门 */
+  #gate { position: fixed; inset: 0; background: var(--bg); z-index: 20; display: flex;
+          align-items: center; justify-content: center; padding: 24px; }
+  #gate .card { width: 100%; max-width: 360px; }
+</style>
+</head>
+<body>
+<div id="gate">
+  <div class="card">
+    <h2 style="margin-top:0">🔆 安装预约</h2>
+    <p class="hint">请输入访问口令（向安装团队索取）。</p>
+    <div class="row"><input id="code" type="password" placeholder="访问口令" autocomplete="current-password"></div>
+    <button class="btn" onclick="enter()">进入</button>
+    <div class="err" id="gateErr"></div>
+  </div>
+</div>
+
+<div class="wrap" hidden id="app">
+  <h1>🔆 安装预约<small id="adminBadge" hidden>管理模式</small></h1>
+
+  <div class="card">
+    <div class="cal-head">
+      <button class="nav-btn" onclick="shiftMonth(-1)">‹</button>
+      <b id="calTitle"></b>
+      <button class="nav-btn" onclick="shiftMonth(1)">›</button>
+    </div>
+    <div class="grid" id="calGrid"></div>
+    <div class="legend">
+      <span><i style="background:var(--free-bg);border:1px solid #bbe7cc"></i>可预约</span>
+      <span><i style="background:var(--full-bg);border:1px solid #f3c6c6"></i>已满</span>
+      <span><i style="background:var(--blocked-bg)"></i>不可约</span>
+    </div>
+  </div>
+
+  <div class="card">
+    <b style="font-size:15px">近期预约</b>
+    <div id="myList" style="margin-top:10px"><span class="hint">加载中…</span></div>
+  </div>
+
+  <footer><button onclick="toggleAdmin()">管理入口</button></footer>
+</div>
+
+<!-- 日详情 -->
+<div class="sheet-bg" id="bg" onclick="closeSheets()"></div>
+<div class="sheet" id="daySheet">
+  <h2 id="dayTitle"></h2>
+  <div id="dayInfo" class="hint" style="margin-bottom:10px"></div>
+  <div id="dayBookings"></div>
+  <div id="dayActions"></div>
+  <button class="btn ghost" onclick="closeSheets()">关闭</button>
+</div>
+
+<!-- 预约表单 -->
+<div class="sheet" id="formSheet">
+  <h2 id="formTitle"></h2>
+  <div class="row"><label>供应商 / 公司名 *</label><input id="fSupplier"></div>
+  <div class="row"><label>联系人</label><input id="fContact"></div>
+  <div class="row"><label>电话</label><input id="fPhone" type="tel"></div>
+  <div class="row"><label>安装地址 *</label><input id="fAddress" placeholder="街道, 城市, 省, 邮编"></div>
+  <div class="row" style="display:flex;gap:8px">
+    <div style="flex:1"><label>板数 *</label><input id="fPanels" type="number" min="1" inputmode="numeric"></div>
+    <div style="flex:1"><label>组件瓦数</label><input id="fModel" placeholder="如 500W"></div>
+  </div>
+  <div class="row"><label>备注（门禁码、停车、注意事项…）</label><textarea id="fNotes" rows="2"></textarea></div>
+  <div class="row"><label>Site Survey（照片/PDF，可多选）</label>
+    <input id="fSurvey" type="file" multiple accept="image/*,.pdf"></div>
+  <div class="row"><label>SLD 单线图（照片/PDF，可多选）</label>
+    <input id="fSld" type="file" multiple accept="image/*,.pdf"></div>
+  <button class="btn" id="fSubmit" onclick="submitBooking()">提交预约</button>
+  <div class="err" id="formErr"></div>
+  <button class="btn ghost" onclick="closeSheets()">取消</button>
+</div>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const state = {
+  code: localStorage.getItem("portal_code") || "",
+  admin: localStorage.getItem("portal_admin") || "",
+  ym: null,          // "YYYY-MM" 当前显示的月
+  today: null,       // 服务端给的本地今天
+  days: new Map(),   // date -> {used, capacity, blocked}
+  formDate: null,
+};
+
+function headers() {
+  const h = { "x-portal-code": state.code };
+  if (state.admin) h["x-portal-admin"] = state.admin;
+  return h;
+}
+async function api(path, opts = {}) {
+  const res = await fetch("/portal/api" + path, { ...opts, headers: { ...headers(), ...(opts.headers || {}) } });
+  if (res.status === 401) { logout(); throw new Error("口令不对或已失效"); }
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(body.error || ("HTTP " + res.status));
+  return body;
+}
+
+// ---- 口令门 ----
+async function enter() {
+  state.code = $("code").value.trim();
+  $("gateErr").textContent = "";
+  try {
+    await refreshCalendar();               // 用日历接口验口令
+    localStorage.setItem("portal_code", state.code);
+    $("gate").style.display = "none";
+    $("app").hidden = false;
+    refreshList();
+  } catch (e) { $("gateErr").textContent = e.message; }
+}
+function logout() {
+  localStorage.removeItem("portal_code");
+  $("gate").style.display = "flex";
+  $("app").hidden = true;
+}
+
+// ---- 日历 ----
+function monthRange(ym) {
+  const [y, m] = ym.split("-").map(Number);
+  const last = new Date(Date.UTC(y, m, 0)).getUTCDate();
+  return { from: `${ym}-01`, to: `${ym}-${String(last).padStart(2, "0")}`, first: new Date(Date.UTC(y, m - 1, 1)), lastDay: last };
+}
+function shiftMonth(d) {
+  const [y, m] = state.ym.split("-").map(Number);
+  const nd = new Date(Date.UTC(y, m - 1 + d, 1));
+  state.ym = nd.toISOString().slice(0, 7);
+  refreshCalendar();
+}
+async function refreshCalendar() {
+  if (!state.ym) state.ym = new Date().toISOString().slice(0, 7);
+  const r = monthRange(state.ym);
+  const data = await api(`/calendar?from=${r.from}&to=${r.to}`);
+  state.today = data.today;
+  state.days = new Map(data.days.map((d) => [d.date, d]));
+  renderCalendar(r);
+}
+function renderCalendar(r) {
+  const [y, m] = state.ym.split("-").map(Number);
+  $("calTitle").textContent = `${y} 年 ${m} 月`;
+  const g = $("calGrid");
+  g.innerHTML = "";
+  for (const d of ["日", "一", "二", "三", "四", "五", "六"]) {
+    const el = document.createElement("div"); el.className = "dow"; el.textContent = d; g.appendChild(el);
+  }
+  for (let i = 0; i < r.first.getUTCDay(); i++) {
+    const el = document.createElement("div"); el.className = "day off"; g.appendChild(el);
+  }
+  for (let dd = 1; dd <= r.lastDay; dd++) {
+    const date = `${state.ym}-${String(dd).padStart(2, "0")}`;
+    const info = state.days.get(date) || { used: 0, capacity: 1, blocked: false };
+    const el = document.createElement("div");
+    let cls = "day", st = "";
+    if (date < state.today) cls += " past";
+    else if (info.blocked) { cls += " blocked"; st = "不可约"; }
+    else if (info.used >= info.capacity) { cls += " full"; st = "已满"; }
+    else { cls += " free"; st = "可约"; }
+    if (date === state.today) cls += " today";
+    el.className = cls;
+    el.innerHTML = `${dd}<span class="st">${st}</span>`;
+    if (date >= state.today || state.admin) el.onclick = () => openDay(date);
+    g.appendChild(el);
+  }
+}
+
+// ---- 日详情 ----
+async function openDay(date) {
+  const info = state.days.get(date) || { used: 0, capacity: 1, blocked: false };
+  $("dayTitle").textContent = fmtDate(date);
+  $("dayInfo").textContent = info.blocked
+    ? `当日不可预约${info.reason ? "：" + info.reason : ""}`
+    : `已占 ${info.used} / ${info.capacity} 个名额`;
+  $("dayBookings").innerHTML = `<span class="hint">加载中…</span>`;
+  $("dayActions").innerHTML = "";
+  openSheet("daySheet");
+
+  const canBook = !info.blocked && info.used < info.capacity && date >= state.today;
+  let html = "";
+  if (canBook) html += `<button class="btn" onclick="openForm('${date}')">预约这一天</button>`;
+  if (state.admin) {
+    html += info.blocked
+      ? `<button class="btn small ok" onclick="unblock('${date}')">解除封锁</button>`
+      : `<button class="btn small danger" onclick="block('${date}')">封锁这一天</button>`;
+  }
+  $("dayActions").innerHTML = html;
+
+  try {
+    const list = await api(`/bookings?from=${date}&to=${date}`);
+    $("dayBookings").innerHTML = list.length ? list.map(bkHtml).join("") : `<span class="hint">这一天还没有预约。</span>`;
+  } catch (e) { $("dayBookings").innerHTML = `<span class="err">${e.message}</span>`; }
+}
+function bkHtml(b) {
+  const stCN = { pending: "待确认", confirmed: "已确认", cancelled: "已取消" }[b.status] || b.status;
+  let act = "";
+  if (b.status === "pending") act += `<button class="btn small danger" onclick="setStatus(${b.id},'cancelled')">取消</button>`;
+  if (state.admin && b.status === "pending") act += `<button class="btn small ok" onclick="setStatus(${b.id},'confirmed')">确认</button>`;
+  if (state.admin && b.status === "confirmed") act += `<button class="btn small danger" onclick="setStatus(${b.id},'cancelled')">取消</button>`;
+  return `<div class="bk"><span class="chip ${b.status}">${stCN}</span>
+    <b>${esc(b.supplier)}</b> · ${b.panels} 块${b.panel_model ? " · " + esc(b.panel_model) : ""}
+    <div class="meta">${esc(b.address)}${b.notes ? "<br>📝 " + esc(b.notes) : ""}</div>
+    <div class="files" id="files-${b.id}"></div>
+    <div style="margin-top:6px">${act}
+      <button class="btn small" style="background:var(--bg);color:var(--ink)" onclick="loadFiles(${b.id})">附件</button>
+    </div></div>`;
+}
+async function loadFiles(id) {
+  const el = $("files-" + id);
+  el.innerHTML = `<span class="hint">加载中…</span>`;
+  try {
+    const b = await api(`/bookings/${id}`);
+    const kindCN = { site_survey: "Site Survey", sld: "SLD", other: "附件" };
+    el.innerHTML = b.files.length
+      ? b.files.map((f) => `<a href="#" onclick="openFile(${f.id});return false">📎 ${kindCN[f.kind] || f.kind}·${esc(f.filename)}</a>`).join("")
+      : `<span class="hint">无附件</span>`;
+  } catch (e) { el.innerHTML = `<span class="err">${e.message}</span>`; }
+}
+// fetch 带口令头拿文件,再用 blob URL 打开(直接 <a href> 带不上鉴权头)
+async function openFile(id) {
+  const res = await fetch(`/portal/api/files/${id}`, { headers: headers() });
+  if (!res.ok) return alert("附件加载失败");
+  const url = URL.createObjectURL(await res.blob());
+  window.open(url, "_blank");
+}
+
+async function setStatus(id, status) {
+  if (!confirm(status === "cancelled" ? "确定取消这条预约？" : "确认这条预约？")) return;
+  try {
+    await api(`/bookings/${id}`, { method: "PATCH", body: JSON.stringify({ status }), headers: { "content-type": "application/json" } });
+    await refreshCalendar(); refreshList(); closeSheets();
+  } catch (e) { alert(e.message); }
+}
+async function block(date) {
+  const reason = prompt("封锁原因（可留空）：") ?? "";
+  try { await api(`/blocked/${date}`, { method: "PUT", body: JSON.stringify({ reason }), headers: { "content-type": "application/json" } });
+    await refreshCalendar(); closeSheets(); } catch (e) { alert(e.message); }
+}
+async function unblock(date) {
+  try { await api(`/blocked/${date}`, { method: "DELETE" }); await refreshCalendar(); closeSheets(); } catch (e) { alert(e.message); }
+}
+
+// ---- 预约表单 ----
+function openForm(date) {
+  state.formDate = date;
+  $("formTitle").textContent = `预约 ${fmtDate(date)}`;
+  $("fSupplier").value = localStorage.getItem("my_supplier") || "";
+  $("fContact").value = localStorage.getItem("my_contact") || "";
+  $("fPhone").value = localStorage.getItem("my_phone") || "";
+  $("formErr").textContent = "";
+  openSheet("formSheet");
+}
+async function submitBooking() {
+  const btn = $("fSubmit");
+  $("formErr").textContent = "";
+  const body = {
+    date: state.formDate,
+    supplier: $("fSupplier").value, contact: $("fContact").value, phone: $("fPhone").value,
+    address: $("fAddress").value, panels: Number($("fPanels").value),
+    panel_model: $("fModel").value, notes: $("fNotes").value,
+  };
+  if (!body.supplier.trim() || !body.address.trim() || !body.panels) {
+    $("formErr").textContent = "供应商、地址、板数为必填。"; return;
+  }
+  btn.disabled = true; btn.textContent = "提交中…";
+  try {
+    const bk = await api("/bookings", { method: "POST", body: JSON.stringify(body), headers: { "content-type": "application/json" } });
+    localStorage.setItem("my_supplier", body.supplier.trim());
+    localStorage.setItem("my_contact", body.contact.trim());
+    localStorage.setItem("my_phone", body.phone.trim());
+    // 逐个上传附件;单个失败不吞掉——告诉用户哪个没传上
+    const failed = [];
+    for (const [inputId, kind] of [["fSurvey", "site_survey"], ["fSld", "sld"]]) {
+      for (const f of $(inputId).files) {
+        btn.textContent = `上传 ${f.name}…`;
+        const fd = new FormData(); fd.append("file", f); fd.append("kind", kind);
+        const res = await fetch(`/portal/api/bookings/${bk.id}/files`, { method: "POST", body: fd, headers: headers() });
+        if (!res.ok) failed.push(f.name);
+      }
+    }
+    $("fSurvey").value = $("fSld").value = $("fAddress").value = $("fNotes").value = "";
+    $("fPanels").value = $("fModel").value = "";
+    await refreshCalendar(); refreshList(); closeSheets();
+    alert(failed.length ? `预约成功,但这些附件上传失败:\n${failed.join("\n")}\n可稍后重试。` : "预约成功！我们确认后会联系你。");
+  } catch (e) { $("formErr").textContent = e.message; }
+  btn.disabled = false; btn.textContent = "提交预约";
+}
+
+// ---- 近期预约列表 ----
+async function refreshList() {
+  try {
+    const from = state.today || new Date().toISOString().slice(0, 10);
+    const list = await api(`/bookings?from=${from}`);
+    $("myList").innerHTML = list.length ? list.map((b) => `<div class="bk" onclick="openDay('${b.date}')">
+        <span class="chip ${b.status}">${{ pending: "待确认", confirmed: "已确认", cancelled: "已取消" }[b.status] || b.status}</span>
+        <b>${fmtDate(b.date)}</b> · ${esc(b.supplier)}
+        <div class="meta">${esc(b.address)} · ${b.panels} 块</div></div>`).join("")
+      : `<span class="hint">还没有预约。点日历上的"可约"日期开始。</span>`;
+  } catch (e) { $("myList").innerHTML = `<span class="err">${e.message}</span>`; }
+}
+
+// ---- 管理模式 ----
+function toggleAdmin() {
+  if (state.admin) {
+    state.admin = ""; localStorage.removeItem("portal_admin");
+  } else {
+    const code = prompt("管理口令：");
+    if (!code) return;
+    state.admin = code; localStorage.setItem("portal_admin", code);
+  }
+  $("adminBadge").hidden = !state.admin;
+  refreshCalendar();
+}
+
+// ---- 工具 ----
+function openSheet(id) { closeSheets(); $("bg").classList.add("open"); $(id).classList.add("open"); }
+function closeSheets() { $("bg").classList.remove("open");
+  for (const id of ["daySheet", "formSheet"]) $(id).classList.remove("open"); }
+function fmtDate(d) {
+  const [y, m, dd] = d.split("-").map(Number);
+  const dow = "日一二三四五六"[new Date(Date.UTC(y, m - 1, dd)).getUTCDay()];
+  return `${m} 月 ${dd} 日（周${dow}）`;
+}
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
+// ---- 启动 ----
+$("adminBadge").hidden = !state.admin;
+$("code").addEventListener("keydown", (e) => { if (e.key === "Enter") enter(); });
+if (state.code) { $("code").value = state.code; enter(); }
+</script>
+</body>
+</html>

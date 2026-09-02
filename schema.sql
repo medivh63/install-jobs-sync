@@ -49,3 +49,41 @@ CREATE TABLE IF NOT EXISTS ff_jobs (
   panel_model TEXT,              -- solar_panel_id 经选项表翻译成的 "500W"
   fetched_at  TEXT NOT NULL      -- 上次拉详情的时间,过期才重拉
 );
+
+-- ==================== 供应商预约门户 ====================
+-- 供应商在 /(public/index.html)看施工日历、book 安装。同样由 ensureSchema 自动建表。
+
+-- 供应商发起的安装预约,预约即创建 job 信息(地址/板数/组件瓦数 + R2 附件)。
+CREATE TABLE IF NOT EXISTS bookings (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  date        TEXT NOT NULL,               -- 预约的安装日 YYYY-MM-DD(本地日)
+  supplier    TEXT NOT NULL,               -- 供应商/公司名
+  contact     TEXT NOT NULL DEFAULT '',    -- 联系人
+  phone       TEXT NOT NULL DEFAULT '',
+  address     TEXT NOT NULL,               -- 安装地址
+  panels      INTEGER NOT NULL,            -- 板数
+  panel_model TEXT NOT NULL DEFAULT '',    -- 组件瓦数,形如 "500W"(与 items.panel_model 同格式)
+  notes       TEXT NOT NULL DEFAULT '',
+  status      TEXT NOT NULL DEFAULT 'pending',  -- pending / confirmed / cancelled
+  created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+CREATE INDEX IF NOT EXISTS idx_bookings_date ON bookings (date, status);
+
+-- 预约附件(site survey / SLD 单线图):文件体在 R2(FILES 桶),这里只存元数据。
+CREATE TABLE IF NOT EXISTS booking_files (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  booking_id   INTEGER NOT NULL REFERENCES bookings(id),
+  kind         TEXT NOT NULL,              -- site_survey / sld / other
+  filename     TEXT NOT NULL,
+  size         INTEGER NOT NULL DEFAULT 0,
+  content_type TEXT NOT NULL DEFAULT '',
+  r2_key       TEXT NOT NULL,
+  created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+CREATE INDEX IF NOT EXISTS idx_files_booking ON booking_files (booking_id);
+
+-- 管理员封锁的日期(放假/满班),供应商不可约。
+CREATE TABLE IF NOT EXISTS blocked_days (
+  date    TEXT PRIMARY KEY,                -- YYYY-MM-DD
+  reason  TEXT NOT NULL DEFAULT ''
+);

@@ -2,6 +2,17 @@ name = "install-jobs-sync"
 main = "src/index.js"
 compatibility_date = "2026-07-30"
 
+# 供应商预约门户的静态页面:命中 public/ 下的路径直接出文件(/ → index.html),
+# 未命中(/jobs、/bookings、/run、/portal/api/*)才进 Worker。
+[assets]
+directory = "./public"
+
+# 预约附件(site survey / SLD)存 R2,D1 只存元数据。首次部署前:
+#   wrangler r2 bucket create install-jobs-files
+[[r2_buckets]]
+binding = "FILES"
+bucket_name = "install-jobs-files"
+
 # cron:每 30 分钟一次。要更低频就改这里(如每 2 小时 "0 */2 * * *")
 [triggers]
 crons = ["*/3 * * * *"]
@@ -19,13 +30,17 @@ WINDOW_DAYS = "30"             # 统一"未来窗口"天数;B 家 API 必须给�
 SCH_TZ      = "America/Edmonton"  # B 家 slot 是 UTC,按这个时区折算安装日(阿省=Mountain Time)
 SCH_DETAIL_TTL_H = "24"         # B 家 project 详情缓存时长(小时);详情给结构化姓名/电话/邮箱/地址/板数/瓦数
 FF_DETAIL_TTL_H  = "24"         # A 家 job 详情缓存时长(小时);详情给电话/邮箱/组件瓦数。缺省沿用上面那个
+CAPACITY_PER_DAY = "1"          # 预约门户:每天最多接几单安装(items 在途 + 未取消预约合计)
 
 # 敏感值走 secret,别写在这里:
 #   wrangler secret put FF_SESSION   # Firefly ff_session cookie(⚠️会过期,需定期更新)
 #   wrangler secret put SCH_TOKEN    # SubcontractorHub Bearer token(长效)
 #   wrangler secret put SCH_SID      # (可选)x-sid,实测不填也能通过;设了才发
 #   wrangler secret put WEBHOOK_URL  # (可选)变化/告警通知 webhook
-#   wrangler secret put READ_TOKEN   # ⚠️必需:/jobs 和 /run 的 Bearer 口令。
-#     没设的话两个接口一律 503(fail closed)。/jobs 会返回客户姓名/电话/邮箱/
+#   wrangler secret put READ_TOKEN   # ⚠️必需:/jobs、/bookings 和 /run 的 Bearer 口令。
+#     没设的话这些接口一律 503(fail closed)。/jobs 会返回客户姓名/电话/邮箱/
 #     精确地址,/run 会打供应商接口耗配额,都不能裸奔。solarcrew 的
 #     INSTALL_JOBS_TOKEN 必须与此一致。
+#   wrangler secret put PORTAL_CODE        # ⚠️门户必需:供应商登录口令(共享)。
+#     没设的话 /portal/api/* 一律 503(fail closed)。
+#   wrangler secret put PORTAL_ADMIN_CODE  # 门户管理口令:确认/取消预约、封锁日期。

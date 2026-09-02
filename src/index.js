@@ -30,7 +30,14 @@ export default {
   async fetch(req, env) {
     const url = new URL(req.url);
 
-    // 两个接口都要鉴权:/jobs 返回客户 PII,/run 会打供应商接口。
+    // 供应商预约门户(页面在 public/ 由静态资产托管,这里只答 API)。
+    // 独立鉴权(PORTAL_CODE),见 portal() —— 供应商不该拿 READ_TOKEN。
+    if (url.pathname.startsWith("/portal/api/")) {
+      await ensureSchema(env);
+      return portal(req, env, url);
+    }
+
+    // 其余接口都要鉴权:/jobs、/bookings 返回客户 PII,/run 会打供应商接口。
     const denied = authorize(req, env);
     if (denied) return denied;
 
@@ -49,6 +56,23 @@ export default {
         "SELECT source, kind, external_id, ref, customer, address, phone, email, panels, panel_model, note, description, install_date, status FROM items" +
         (where.length ? " WHERE " + where.join(" AND ") : "") +
         " ORDER BY install_date";
+      const { results } = await env.DB.prepare(sql).bind(...binds).all();
+      return Response.json(results);
+    }
+
+    // 下游(solarcrew)读供应商预约:与 /jobs 同一 Bearer 鉴权。
+    // 可选 ?from=2026-09-01&to=2026-09-30&include_cancelled=1
+    if (url.pathname === "/bookings") {
+      await ensureSchema(env);
+      const p = url.searchParams;
+      const where = p.get("include_cancelled") ? [] : ["status != 'cancelled'"];
+      const binds = [];
+      if (p.get("from")) { where.push("date >= ?"); binds.push(p.get("from")); }
+      if (p.get("to"))   { where.push("date <= ?"); binds.push(p.get("to")); }
+      const sql =
+        "SELECT id, date, supplier, contact, phone, address, panels, panel_model, notes, status, created_at FROM bookings" +
+        (where.length ? " WHERE " + where.join(" AND ") : "") +
+        " ORDER BY date";
       const { results } = await env.DB.prepare(sql).bind(...binds).all();
       return Response.json(results);
     }
@@ -104,6 +128,31 @@ async function ensureSchema(env) {
   for (const [name, type] of [["panels", "INTEGER"], ["panel_model", "TEXT"]]) {
     if (!spHave.has(name)) await env.DB.prepare(`ALTER TABLE sch_projects ADD COLUMN ${name} ${type}`).run();
   }
+
+  // ---- 供应商预约门户的三张表(见 portal())----
+  await env.DB.prepare(
+    `CREATE TABLE IF NOT EXISTS bookings (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      date TEXT NOT NULL, supplier TEXT NOT NULL, contact TEXT NOT NULL DEFAULT '',
+      phone TEXT NOT NULL DEFAULT '', address TEXT NOT NULL, panels INTEGER NOT NULL,
+      panel_model TEXT NOT NULL DEFAULT '', notes TEXT NOT NULL DEFAULT '',
+      status TEXT NOT NULL DEFAULT 'pending',
+      created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')))`
+  ).run();
+  await env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_bookings_date ON bookings (date, status)`).run();
+  await env.DB.prepare(
+    `CREATE TABLE IF NOT EXISTS booking_files (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      booking_id INTEGER NOT NULL REFERENCES bookings(id),
+      kind TEXT NOT NULL, filename TEXT NOT NULL, size INTEGER NOT NULL DEFAULT 0,
+      content_type TEXT NOT NULL DEFAULT '', r2_key TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')))`
+  ).run();
+  await env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_files_booking ON booking_files (booking_id)`).run();
+  await env.DB.prepare(
+    `CREATE TABLE IF NOT EXISTS blocked_days (
+      date TEXT PRIMARY KEY, reason TEXT NOT NULL DEFAULT '')`
+  ).run();
 }
 
 async function runAll(env) {
@@ -609,7 +658,7 @@ function must(v, name) {
 // 它和生产共用 secret 与 D1,只在生产上挂 Cloudflare Access 挡不住它。
 function authorize(req, env) {
   const path = new URL(req.url).pathname;
-  if (path !== "/jobs" && path !== "/run") return null; // 其余走 404
+  if (path !== "/jobs" && path !== "/bookings" && path !== "/run") return null; // 其余走 404
 
   if (!env.READ_TOKEN)
     return new Response("READ_TOKEN not configured\n", { status: 503 });
@@ -643,3 +692,217 @@ async function alert(env, msg) {
 
 const post = (url, body) =>
   fetch(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+
+// ==================== 供应商预约门户 ====================
+// 供应商看施工日历(每天占用数 vs 容量),挑空闲日 book 安装,预约时填 job 信息
+// (地址/板数/组件瓦数)并上传 site survey / SLD(存 R2)。
+//
+// 隐私边界:items 里是各家客户的姓名/电话/精确地址,供应商之间不能互看。
+// 所以 /calendar 只给"每天占了几个名额"这一个数,绝不透出 items 的任何行。
+// bookings 是供应商自己填的,门户内共享口令下彼此可见(伙伴间可接受;要隔离
+// 就得给每家发独立口令,是下一步的事)。
+
+const json = (data, status = 200) => Response.json(data, { status });
+const isYmd = (s) => typeof s === "string" && /^\d{4}-\d{2}-\d{2}$/.test(s);
+const str = (v) => (typeof v === "string" ? v.trim() : "");
+const dayCapacity = (env) => Math.max(1, Number(env.CAPACITY_PER_DAY ?? 1) || 1);
+
+// 与 READ_TOKEN 同样 fail closed:口令没配就 503,不是"没配就放行"。
+function portalAuth(req, env) {
+  if (!env.PORTAL_CODE) return new Response("PORTAL_CODE not configured\n", { status: 503 });
+  if (req.headers.get("x-portal-code") !== env.PORTAL_CODE) return json({ error: "unauthorized" }, 401);
+  return null;
+}
+const isAdmin = (req, env) =>
+  !!env.PORTAL_ADMIN_CODE && req.headers.get("x-portal-admin") === env.PORTAL_ADMIN_CODE;
+
+async function portal(req, env, url) {
+  const denied = portalAuth(req, env);
+  if (denied) return denied;
+
+  const c = cfg(env);
+  const path = url.pathname.slice("/portal/api".length);
+  let m;
+
+  if (req.method === "GET"  && path === "/calendar") return calendar(env, c, url.searchParams);
+  if (req.method === "GET"  && path === "/bookings") return listBookings(env, url.searchParams);
+  if (req.method === "POST" && path === "/bookings") return createBooking(req, env, c);
+  if ((m = path.match(/^\/bookings\/(\d+)$/))) {
+    if (req.method === "GET")   return getBooking(env, m[1]);
+    if (req.method === "PATCH") return patchBooking(req, env, m[1]);
+  }
+  if ((m = path.match(/^\/bookings\/(\d+)\/files$/)) && req.method === "POST")
+    return uploadBookingFile(req, env, m[1]);
+  if ((m = path.match(/^\/files\/(\d+)$/)) && req.method === "GET") return serveBookingFile(env, m[1]);
+  if ((m = path.match(/^\/blocked\/(\d{4}-\d{2}-\d{2})$/))) {
+    if (!isAdmin(req, env)) return json({ error: "admin only" }, 403);
+    if (req.method === "PUT") {
+      const b = await req.json().catch(() => ({}));
+      await env.DB.prepare(
+        `INSERT INTO blocked_days (date, reason) VALUES (?, ?)
+         ON CONFLICT(date) DO UPDATE SET reason = excluded.reason`
+      ).bind(m[1], str(b?.reason)).run();
+      return json({ ok: true });
+    }
+    if (req.method === "DELETE") {
+      await env.DB.prepare(`DELETE FROM blocked_days WHERE date = ?`).bind(m[1]).run();
+      return json({ ok: true });
+    }
+  }
+  return json({ error: "not found" }, 404);
+}
+
+// 日历:from~to 每天 { date, used, capacity, blocked }。
+// used = 同步来的在途安装(items,gone_at IS NULL)+ 未取消预约(bookings)。
+async function calendar(env, c, p) {
+  const from = p.get("from"), to = p.get("to");
+  if (!isYmd(from) || !isYmd(to) || from > to) return json({ error: "from/to (YYYY-MM-DD) required" }, 400);
+  const days = eachDay(from, to);
+  if (days.length > 120) return json({ error: "range too large (max 120 days)" }, 400);
+
+  const [items, books, blocked] = await Promise.all([
+    env.DB.prepare(`SELECT install_date AS d, COUNT(*) AS n FROM items
+                    WHERE gone_at IS NULL AND install_date BETWEEN ? AND ? GROUP BY install_date`)
+      .bind(from, to).all(),
+    env.DB.prepare(`SELECT date AS d, COUNT(*) AS n FROM bookings
+                    WHERE status != 'cancelled' AND date BETWEEN ? AND ? GROUP BY date`)
+      .bind(from, to).all(),
+    env.DB.prepare(`SELECT date, reason FROM blocked_days WHERE date BETWEEN ? AND ?`)
+      .bind(from, to).all(),
+  ]);
+  const used = new Map();
+  for (const r of items.results ?? []) used.set(r.d, (used.get(r.d) ?? 0) + r.n);
+  for (const r of books.results ?? []) used.set(r.d, (used.get(r.d) ?? 0) + r.n);
+  const blk = new Map((blocked.results ?? []).map((r) => [r.date, r.reason || ""]));
+
+  const capacity = dayCapacity(env);
+  return json({
+    today: localDate(new Date().toISOString(), c.schTz),
+    capacity,
+    days: days.map((date) => ({
+      date, used: used.get(date) ?? 0, capacity,
+      blocked: blk.has(date), reason: blk.get(date) ?? null,
+    })),
+  });
+}
+
+async function listBookings(env, p) {
+  const where = [], binds = [];
+  if (isYmd(p.get("from"))) { where.push("date >= ?"); binds.push(p.get("from")); }
+  if (isYmd(p.get("to")))   { where.push("date <= ?"); binds.push(p.get("to")); }
+  const { results } = await env.DB.prepare(
+    `SELECT * FROM bookings` + (where.length ? " WHERE " + where.join(" AND ") : "") +
+    ` ORDER BY date, id`
+  ).bind(...binds).all();
+  return json(results);
+}
+
+async function getBooking(env, id) {
+  const row = await env.DB.prepare(`SELECT * FROM bookings WHERE id = ?`).bind(id).first();
+  if (!row) return json({ error: "not found" }, 404);
+  const files = await env.DB.prepare(
+    `SELECT id, kind, filename, size, content_type, created_at FROM booking_files WHERE booking_id = ? ORDER BY id`
+  ).bind(id).all();
+  return json({ ...row, files: files.results ?? [] });
+}
+
+async function createBooking(req, env, c) {
+  const b = await req.json().catch(() => null);
+  const date = b?.date, supplier = str(b?.supplier), address = str(b?.address);
+  const panels = Number(b?.panels);
+  if (!isYmd(date))            return json({ error: "date (YYYY-MM-DD) required" }, 400);
+  if (!supplier || !address)   return json({ error: "supplier and address required" }, 400);
+  if (!Number.isInteger(panels) || panels <= 0) return json({ error: "panels must be a positive integer" }, 400);
+
+  const today = localDate(new Date().toISOString(), c.schTz);
+  if (date < today) return json({ error: "date is in the past" }, 409);
+  if (await env.DB.prepare(`SELECT date FROM blocked_days WHERE date = ?`).bind(date).first())
+    return json({ error: "day is blocked" }, 409);
+
+  // 名额检查和插入之间没有锁,并发下可能超订一单 —— 雏形先接受,
+  // 管理员确认环节能兜住(超了就改期/取消其一)。
+  const usedRow = await env.DB.prepare(
+    `SELECT (SELECT COUNT(*) FROM items    WHERE gone_at IS NULL     AND install_date = ?) +
+            (SELECT COUNT(*) FROM bookings WHERE status != 'cancelled' AND date = ?) AS n`
+  ).bind(date, date).first();
+  if ((usedRow?.n ?? 0) >= dayCapacity(env)) return json({ error: "day is full" }, 409);
+
+  const row = await env.DB.prepare(
+    `INSERT INTO bookings (date, supplier, contact, phone, address, panels, panel_model, notes)
+     VALUES (?,?,?,?,?,?,?,?) RETURNING *`
+  ).bind(date, supplier, str(b?.contact), str(b?.phone), address, panels, str(b?.panel_model), str(b?.notes)).first();
+
+  if (env.WEBHOOK_URL)
+    await post(env.WEBHOOK_URL, { text: `📅 [portal] 新预约 #${row.id} ${supplier} — ${date} — ${address}(${panels} 块)` });
+  return json(row, 201);
+}
+
+// 状态流转:供应商(共享口令)只能取消自己 pending 的预约;
+// confirm、取消 confirmed、恢复 pending 都是管理员(X-Portal-Admin)的事。
+async function patchBooking(req, env, id) {
+  const b = await req.json().catch(() => null);
+  const status = b?.status;
+  if (!["pending", "confirmed", "cancelled"].includes(status))
+    return json({ error: "status must be pending/confirmed/cancelled" }, 400);
+
+  const row = await env.DB.prepare(`SELECT * FROM bookings WHERE id = ?`).bind(id).first();
+  if (!row) return json({ error: "not found" }, 404);
+  if (!isAdmin(req, env) && !(status === "cancelled" && row.status === "pending"))
+    return json({ error: "only cancelling a pending booking is allowed; others are admin-only" }, 403);
+
+  const updated = await env.DB.prepare(`UPDATE bookings SET status = ? WHERE id = ? RETURNING *`)
+    .bind(status, id).first();
+  if (env.WEBHOOK_URL && status !== row.status)
+    await post(env.WEBHOOK_URL, { text: `📅 [portal] 预约 #${id} ${row.supplier} ${row.date}:${row.status} → ${status}` });
+  return json(updated);
+}
+
+// 附件(site survey / SLD)。文件体放 R2,D1 只存元数据。
+const FILE_KINDS = ["site_survey", "sld", "other"];
+const MAX_FILE_BYTES = 20 * 1024 * 1024;
+
+async function uploadBookingFile(req, env, bookingId) {
+  if (!env.FILES) return json({ error: "file storage (R2) not configured" }, 503);
+  if (!(await env.DB.prepare(`SELECT id FROM bookings WHERE id = ?`).bind(bookingId).first()))
+    return json({ error: "booking not found" }, 404);
+
+  const fd = await req.formData().catch(() => null);
+  const f = fd?.get("file");
+  const kind = str(fd?.get("kind")) || "other";
+  if (!f || typeof f === "string") return json({ error: "multipart field 'file' required" }, 400);
+  if (!FILE_KINDS.includes(kind))  return json({ error: `kind must be one of ${FILE_KINDS.join("/")}` }, 400);
+  if (f.size > MAX_FILE_BYTES)     return json({ error: "file too large (max 20MB)" }, 413);
+
+  const safeName = (f.name || "file").replace(/[^\w.\-一-鿿]+/g, "_").slice(-100);
+  const key = `bookings/${bookingId}/${kind}-${Date.now()}-${safeName}`;
+  await env.FILES.put(key, f, {
+    httpMetadata: { contentType: f.type || "application/octet-stream" },
+  });
+  const row = await env.DB.prepare(
+    `INSERT INTO booking_files (booking_id, kind, filename, size, content_type, r2_key)
+     VALUES (?,?,?,?,?,?) RETURNING id, kind, filename, size, content_type, created_at`
+  ).bind(bookingId, kind, f.name || "file", f.size, f.type || "", key).first();
+  return json(row, 201);
+}
+
+async function serveBookingFile(env, id) {
+  if (!env.FILES) return json({ error: "file storage (R2) not configured" }, 503);
+  const meta = await env.DB.prepare(`SELECT * FROM booking_files WHERE id = ?`).bind(id).first();
+  if (!meta) return json({ error: "not found" }, 404);
+  const obj = await env.FILES.get(meta.r2_key);
+  if (!obj) return json({ error: "file body missing" }, 404);
+  return new Response(obj.body, {
+    headers: {
+      "content-type": meta.content_type || "application/octet-stream",
+      "content-disposition": `inline; filename*=UTF-8''${encodeURIComponent(meta.filename)}`,
+    },
+  });
+}
+
+function eachDay(from, to) {
+  const out = [];
+  let t = Date.parse(from + "T00:00:00Z");
+  const end = Date.parse(to + "T00:00:00Z");
+  for (; t <= end && out.length <= 121; t += 86400000) out.push(new Date(t).toISOString().slice(0, 10));
+  return out;
+}
